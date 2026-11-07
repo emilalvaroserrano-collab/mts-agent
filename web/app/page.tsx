@@ -75,7 +75,37 @@ export default function Page() {
 }
 
 function SupportCall({ onRestart }: { onRestart: () => void }) {
-  const tokenSource = useMemo(() => TokenSource.endpoint("/api/token"), []);
+  const handoff = useRef("");
+  useEffect(() => {
+    function onMessage(event: MessageEvent) {
+      if (event.data?.type !== "mts-user" || typeof event.data.code !== "string") return;
+      handoff.current = event.data.code.slice(0, 80);
+    }
+    window.addEventListener("message", onMessage);
+    window.parent?.postMessage({ type: "mts-agent-ready" }, "*");
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+  const tokenSource = useMemo(
+    () =>
+      TokenSource.custom(async () => {
+        const started = Date.now();
+        while (!handoff.current && Date.now() - started < 2500) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        const response = await fetch("/api/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code: handoff.current }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "The call could not connect.");
+        return {
+          serverUrl: data.serverUrl || data.server_url,
+          participantToken: data.participantToken || data.participant_token,
+        };
+      }),
+    [],
+  );
   const session = useSession(tokenSource);
 
   return (
