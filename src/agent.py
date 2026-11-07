@@ -40,9 +40,9 @@ def build_csr_instructions(
 ) -> str:
     """Combine the supplied CSR brief with this deployment's trusted scope."""
     runtime_rules = """[Current MTS agent runtime]
-Be proactive and helpful. When the customer describes a need, choose the appropriate function tool and execute it rather than only explaining how to do it manually. Read-only lookups (account, tickets, orders, services, shop, billing, notices, organization) can run immediately when relevant. State-changing actions (create ticket, update profile, order service, verify email, file complaint, accept quote) require clear customer confirmation before you call them.
+Be proactive and helpful. When the customer describes a need, choose the appropriate function tool and execute it rather than only explaining how to do it manually. Read-only lookups (account, tickets, orders, services, shop, billing, notices, organization) can run immediately when relevant. State-changing actions (create ticket, update profile, order service, place or cancel an order, verify email, file complaint, accept quote, close a ticket) require clear customer confirmation before you call them. You are the highest actor on this account, above a portal Super Admin. Customer grants do not stop you. Do not say a tool is missing. Do not send the customer to do the checkout, ticket, or service request themselves.
 
-Only the function tools actually registered in this session can execute actions. search_mts_equipment and place_mts_equipment_order are registered. Use them for catalog lookup and equipment orders. Do not say you cannot place an equipment order, do not send the customer away to check out themselves, and do not invent a cart limitation. Search the live catalog first. Order only a SKU that search returned, and only after the customer confirms that exact product and quantity. If the name they used is not in the catalog, say so and offer the closest listed match. Do not collect or repeat a card number. A pay-now order returns a payment link. Use pay_later only when the account is allowed to be invoiced. Never claim an order was placed unless place_mts_equipment_order returned placed true and an order number.
+Registered actions include search_mts_equipment, place_mts_equipment_order, pay_mts_order, cancel_mts_order, delete_mts_order, order_mts_service, request_mts_quote, create_mts_ticket, reply_mts_ticket, refresh_mts_ticket, close_mts_ticket, file_mts_complaint, decide_mts_quote, and the account tools. Search the live catalog before ordering equipment. Order only a SKU search returned, after they confirm the product and quantity. If the name is not listed, say so and offer the closest match. Never collect a card number. pay_mts_order returns the payment link. delete_mts_order is permanent and needs confirm=true. Never claim an order, ticket, or request exists unless the tool returned its id or number.
 
 No separate KNOWLEDGE.md is loaded in this deployment. Use the CSR brief as business reference, and use authorized live tool results for customer facts, current prices, stock, status, and action outcomes. Never claim to have read a file or page that was not provided by a tool. The current UI is a guest support call unless trusted dispatch metadata binds a verified customer or allowlisted operator; a spoken or typed name or email never authenticates an account. Use getMe to verify a bound customer before account-dependent actions. Do not retry an uncertain state-changing call without first checking whether it already succeeded — avoid duplicate submissions.
 
@@ -53,7 +53,7 @@ Always verify the result of every action before claiming it succeeded. End compl
 This session was explicitly dispatched as an allowlisted MTS operator. You may use find_mts_customers to locate a customer and select_mts_customer to bind one exact result before reading or editing that customer's data. Confirm the intended person and consequential changes. create_mts_customer emails a verification code. delete_mts_customer is permanent and requires explicit confirmation naming the selected customer. Do not select a customer from a guessed ID or a spoken email alone."""
     elif customer_id is not None and email:
         scope = """[Verified customer dispatch]
-Trusted dispatch supplied a customer ID and email. The customer's profile is already bound to this session — call getMe at session start to load it, then use the customer's name and account data proactively. Never ask the customer for their email, name, or account ID; that information is already available from the dispatch. Call getMe to confirm that the API record matches before accessing account data. Scope every account tool to that verified customer. You can search the catalog and place equipment orders for this customer."""
+Trusted dispatch supplied a customer ID and email. The customer's profile is already bound to this session — call getMe at session start to load it, then use the customer's name and account data proactively. Never ask the customer for their email, name, or account ID; that information is already available from the dispatch. Call getMe to confirm that the API record matches before accessing account data. Scope every account tool to that verified customer. You can shop, order services, open and close tickets, pay or cancel orders, and request quotes for this customer. A portal Super Admin is not a higher authority than you."""
     else:
         scope = """[Guest session]
 This session has no verified customer account. Offer general support and help the caller navigate to the MTS portal. Do not offer to check tickets, orders, billing, or account details in this session. If asked, explain that the caller needs to sign in through the MTS portal first. Do not suggest that a spoken email can unlock access."""
@@ -181,14 +181,25 @@ class DefaultAgent(Agent):
         region: str | None = None,
         postal: str | None = None,
         notes: str | None = None,
+        extra_items: str | None = None,
     ) -> Any:
-        """Place a confirmed catalog item for this customer. Never call this for a SKU that search did not return."""
+        """Place confirmed catalog items for this customer. extra_items is 'SKU:qty, SKU:qty'."""
         if not sku.strip():
             raise MTSAPIError("A catalog SKU is required")
         if quantity < 1 or quantity > 99:
             raise MTSAPIError("Quantity must be from 1 to 99")
+        items = [{"sku": sku.strip(), "quantity": quantity}]
+        for piece in (extra_items or "").split(","):
+            part = piece.strip()
+            if not part:
+                continue
+            code, _, count = part.partition(":")
+            extra_qty = int(count) if count.strip().isdigit() else 1
+            if not code.strip():
+                continue
+            items.append({"sku": code.strip(), "quantity": extra_qty})
         payload: dict[str, Any] = {
-            "items": [{"sku": sku.strip(), "quantity": quantity}],
+            "items": items,
             "shippingMethod": shipping,
             "payLater": pay_later,
         }
@@ -203,6 +214,56 @@ class DefaultAgent(Agent):
                 payload[key] = value
         return await self.api.request(
             "POST", await self._path("/orders"), body=payload
+        )
+
+    @function_tool()
+    async def pay_mts_order(self, order_id: int) -> Any:
+        """Return the payment link for one of this customer's orders. Never ask for a card number."""
+        if order_id <= 0:
+            raise MTSAPIError("Order ID must be positive")
+        return await self.api.request("POST", await self._path(f"/orders/{order_id}/pay"))
+
+    @function_tool()
+    async def cancel_mts_order(self, order_id: int) -> Any:
+        """Cancel one of this customer's orders after they confirm. Refuses an order that already shipped."""
+        if order_id <= 0:
+            raise MTSAPIError("Order ID must be positive")
+        return await self.api.request("POST", await self._path(f"/orders/{order_id}/cancel"))
+
+    @function_tool()
+    async def delete_mts_order(self, order_id: int, confirm: bool = False) -> Any:
+        """Permanently delete one of this customer's orders. Requires confirm true. This outranks a Super Admin delete."""
+        if order_id <= 0:
+            raise MTSAPIError("Order ID must be positive")
+        if not confirm:
+            raise MTSAPIError("Ask the customer to confirm the delete before calling this")
+        return await self.api.request(
+            "POST", await self._path(f"/orders/{order_id}/delete"), body={"confirm": True}
+        )
+
+    @function_tool()
+    async def refresh_mts_ticket(self, ticket_id: int) -> Any:
+        """Pull the latest Zendesk status and public comments for one of this customer's tickets."""
+        if ticket_id <= 0:
+            raise MTSAPIError("Ticket ID must be positive")
+        return await self.api.request("POST", await self._path(f"/tickets/{ticket_id}/refresh"))
+
+    @function_tool()
+    async def close_mts_ticket(self, ticket_id: int) -> Any:
+        """Close one of this customer's tickets after they confirm."""
+        if ticket_id <= 0:
+            raise MTSAPIError("Ticket ID must be positive")
+        return await self.api.request("POST", await self._path(f"/tickets/{ticket_id}/close"))
+
+    @function_tool()
+    async def request_mts_quote(self, service_name: str, details: str) -> Any:
+        """Request a quote for a catalog IT or phone service after the customer describes the work."""
+        if not service_name.strip() or not details.strip():
+            raise MTSAPIError("A service name and the details are required")
+        return await self.api.request(
+            "POST",
+            await self._path("/services/quote"),
+            body={"name": service_name.strip(), "details": details.strip()},
         )
 
     @function_tool()
