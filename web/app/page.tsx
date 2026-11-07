@@ -165,6 +165,29 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.room]);
 
+  useEffect(() => {
+    const resume = () => {
+      void session.room.startAudio().catch(() => undefined);
+    };
+    if ("mediaSession" in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: "Sarah",
+        artist: "Manage Tech Service",
+      });
+      navigator.mediaSession.playbackState = "playing";
+    }
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("focus", resume);
+    window.addEventListener("pageshow", resume);
+    const keep = window.setInterval(resume, 15000);
+    return () => {
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("focus", resume);
+      window.removeEventListener("pageshow", resume);
+      window.clearInterval(keep);
+    };
+  }, [session.room]);
+
   async function start(kind: "voice" | "chat") {
     if (starting.current || phase !== "incoming") return;
     starting.current = true;
