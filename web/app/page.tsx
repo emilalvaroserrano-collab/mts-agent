@@ -21,9 +21,16 @@ import {
   useSession,
   useSessionMessages,
 } from "@livekit/components-react";
-import { RoomEvent, TokenSource, Track, type RemoteAudioTrack, type RemoteParticipant, type RemoteTrack } from "livekit-client";
+import { AudioPresets, Room, RoomEvent, TokenSource, Track, type LocalAudioTrack, type RemoteAudioTrack, type RemoteParticipant, type RemoteTrack } from "livekit-client";
 
 const MTS_SITE = "https://mts.192-888-702-801.site";
+const MIC_CAPTURE = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+  voiceIsolation: true,
+  channelCount: 1,
+} as const;
 const BROWSER_PATHS = new Set([
   "/",
   "/portal",
@@ -106,7 +113,20 @@ function SupportCall({ onRestart }: { onRestart: () => void }) {
       }),
     [],
   );
-  const session = useSession(tokenSource);
+  const room = useMemo(
+    () =>
+      new Room({
+        audioCaptureDefaults: MIC_CAPTURE,
+        publishDefaults: {
+          dtx: true,
+          red: true,
+          forceStereo: false,
+          audioPreset: AudioPresets.speech,
+        },
+      }),
+    [],
+  );
+  const session = useSession(tokenSource, { room });
 
   return (
     <SessionProvider session={session}>
@@ -200,76 +220,112 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
   useEffect(() => {
     const room = session.room;
     const audio = new AudioContext();
-    const analyser = audio.createAnalyser();
-    analyser.fftSize = 512;
-    analyser.smoothingTimeConstant = 0.25;
+    const speakerMeter = audio.createAnalyser();
+    speakerMeter.fftSize = 512;
+    speakerMeter.smoothingTimeConstant = 0.25;
+    const micMeter = audio.createAnalyser();
+    micMeter.fftSize = 512;
+    micMeter.smoothingTimeConstant = 0.2;
+    const silent = audio.createGain();
+    silent.gain.value = 0;
+    speakerMeter.connect(silent);
+    micMeter.connect(silent);
+    silent.connect(audio.destination);
     const wired = new Set<string>();
-    const tracks = new Set<RemoteAudioTrack>();
+    const speakers = new Set<RemoteAudioTrack>();
+    let micSource: MediaStreamAudioSourceNode | null = null;
     let audible = false;
+    let userSpeaking = false;
+    let voiceFrames = 0;
+    let quietFrames = 0;
+    let appliedVolume = -1;
 
-    const wire = (track: RemoteTrack | undefined) => {
-      if (!track || track.kind !== Track.Kind.Audio || track.attachedElements.length === 0) return;
+    const wireSpeaker = (track: RemoteTrack | undefined) => {
+      if (!track || track.kind !== Track.Kind.Audio) return;
       const audioTrack = track as RemoteAudioTrack;
       const key = audioTrack.sid ?? audioTrack.mediaStreamTrack.id;
       if (wired.has(key)) return;
       try {
-        audioTrack.setAudioContext(audio);
-        audioTrack.setWebAudioPlugins([analyser]);
-        audioTrack.setVolume(hearSarah.current ? 1 : 0);
-      } catch {
-        return;
-      }
-      wired.add(key);
-      tracks.add(audioTrack);
-      void audio.resume();
+        const source = audio.createMediaStreamSource(new MediaStream([audioTrack.mediaStreamTrack]));
+        source.connect(speakerMeter);
+        wired.add(key);
+        speakers.add(audioTrack);
+      } catch { /* the track is not readable yet */ }
+    };
+    const wireMic = () => {
+      const publication = room.localParticipant.getTrackPublication(Track.Source.Microphone);
+      const track = publication?.track as LocalAudioTrack | undefined;
+      if (!track || micSource) return;
+      try {
+        micSource = audio.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
+        micSource.connect(micMeter);
+      } catch { /* mic is not open yet */ }
     };
     const onSubscribed = (track: RemoteTrack, _publication: unknown, participant: RemoteParticipant) => {
-      if (!participant.isLocal) wire(track);
+      if (!participant.isLocal) wireSpeaker(track);
     };
     room.on(RoomEvent.TrackSubscribed, onSubscribed);
     const scan = window.setInterval(() => {
       for (const participant of room.remoteParticipants.values()) {
-        for (const publication of participant.audioTrackPublications.values()) wire(publication.track);
+        for (const publication of participant.audioTrackPublications.values()) wireSpeaker(publication.track);
       }
-      if (audible !== hearSarah.current) {
-        audible = hearSarah.current;
-        for (const track of tracks) track.setVolume(audible ? 1 : 0);
-      }
-    }, 200);
+      wireMic();
+    }, 250);
 
-    const time = new Uint8Array(analyser.fftSize);
-    const freq = new Uint8Array(analyser.frequencyBinCount);
+    const speakerTime = new Uint8Array(speakerMeter.fftSize);
+    const speakerFreq = new Uint8Array(speakerMeter.frequencyBinCount);
+    const micTime = new Uint8Array(micMeter.fftSize);
     let last = 0;
     const tick = (now: number) => {
-      if (audible !== hearSarah.current) {
-        audible = hearSarah.current;
-        for (const track of tracks) track.setVolume(audible ? 1 : 0);
-      }
       if (audio.state === "suspended") void audio.resume();
-      if (hearSarah.current && now - last >= 32) {
-        last = now;
-        analyser.getByteTimeDomainData(time);
+      let micRms = 0;
+      if (micSource) {
+        micMeter.getByteTimeDomainData(micTime);
         let sum = 0;
-        for (let index = 0; index < time.length; index += 1) {
-          const sample = (time[index] - 128) / 128;
+        for (let index = 0; index < micTime.length; index += 1) {
+          const sample = (micTime[index] - 128) / 128;
           sum += sample * sample;
         }
-        const rms = Math.sqrt(sum / time.length);
-        analyser.getByteFrequencyData(freq);
-        const next = Array.from({ length: 14 }, (_, index) => {
-          const band = freq[Math.min(freq.length - 1, index + 1)] / 255;
-          return Math.min(100, Math.round((rms * 12 + band * 1.4) * 100));
-        });
-        setLevels(next);
-        window.parent?.postMessage({ type: "mts-voice", levels: next }, "*");
+        micRms = Math.sqrt(sum / micTime.length);
       }
+      if (micRms > 0.055) {
+        voiceFrames += 1;
+        quietFrames = 0;
+      } else {
+        quietFrames += 1;
+        voiceFrames = 0;
+      }
+      if (!userSpeaking && voiceFrames >= 4) userSpeaking = true;
+      if (userSpeaking && quietFrames >= 18) userSpeaking = false;
+      const volume = !hearSarah.current ? 0 : userSpeaking ? 0.08 : 1;
+      if (volume !== appliedVolume) {
+        appliedVolume = volume;
+        audible = hearSarah.current;
+        for (const track of speakers) track.setVolume(volume);
+      }
+      if (!hearSarah.current || now - last < 32) return;
+      last = now;
+      speakerMeter.getByteTimeDomainData(speakerTime);
+      let sum = 0;
+      for (let index = 0; index < speakerTime.length; index += 1) {
+        const sample = (speakerTime[index] - 128) / 128;
+        sum += sample * sample;
+      }
+      const rms = Math.sqrt(sum / speakerTime.length);
+      speakerMeter.getByteFrequencyData(speakerFreq);
+      const next = Array.from({ length: 14 }, (_, index) => {
+        const band = speakerFreq[Math.min(speakerFreq.length - 1, index + 1)] / 255;
+        return Math.min(100, Math.round((rms * 12 + band * 1.4) * 100));
+      });
+      setLevels(next);
+      window.parent?.postMessage({ type: "mts-voice", levels: next }, "*");
     };
     const meter = window.setInterval(() => tick(performance.now()), 32);
     return () => {
       window.clearInterval(scan);
       window.clearInterval(meter);
       room.off(RoomEvent.TrackSubscribed, onSubscribed);
-      for (const track of tracks) track.setWebAudioPlugins([]);
+      micSource?.disconnect();
       void audio.close();
       window.parent?.postMessage({ type: "mts-voice", levels: [] }, "*");
     };
@@ -304,7 +360,26 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
       setPhase("active");
       if (kind === "voice") {
         try {
-          await session.room.localParticipant.setMicrophoneEnabled(true);
+          const publication = await session.room.localParticipant.setMicrophoneEnabled(true, MIC_CAPTURE, {
+            dtx: true,
+            red: true,
+            forceStereo: false,
+            audioPreset: AudioPresets.speech,
+          });
+          const track = publication?.track;
+          if (track && track.kind === Track.Kind.Audio) {
+            const mic = track as LocalAudioTrack;
+            await mic.applyConstraints({
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+              voiceIsolation: true,
+            }).catch(() => undefined);
+            const noise = await import("@livekit/krisp-noise-filter").catch(() => null);
+            if (noise?.isKrispNoiseFilterSupported()) {
+              await mic.setProcessor(noise.KrispNoiseFilter()).catch(() => undefined);
+            }
+          }
           setMicOn(true);
         } catch {
           setError("Microphone access was denied. You can still message Sarah.");
@@ -325,7 +400,12 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
 
   async function toggleMic() {
     try {
-      await session.room.localParticipant.setMicrophoneEnabled(!micOn);
+      await session.room.localParticipant.setMicrophoneEnabled(!micOn, MIC_CAPTURE, {
+        dtx: true,
+        red: true,
+        forceStereo: false,
+        audioPreset: AudioPresets.speech,
+      });
       setMicOn(!micOn);
       setError("");
     } catch {
