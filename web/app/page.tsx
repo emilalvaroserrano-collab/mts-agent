@@ -211,15 +211,17 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
     const bins = new Uint8Array(analyser.frequencyBinCount);
 
     const attach = (track: RemoteTrack | undefined, local: boolean) => {
-      if (!track || local || track.kind !== Track.Kind.Audio || sources.has(track.sid)) return;
+      const sid = track?.sid;
+      if (!track || !sid || local || track.kind !== Track.Kind.Audio || sources.has(sid)) return;
       const source = audio.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
       source.connect(mix);
-      sources.set(track.sid, source);
+      sources.set(sid, source);
     };
     const onSubscribed = (track: RemoteTrack, _publication: unknown, participant: RemoteParticipant) => {
       attach(track, participant.isLocal);
     };
     const onUnsubscribed = (track: RemoteTrack) => {
+      if (!track.sid) return;
       sources.get(track.sid)?.disconnect();
       sources.delete(track.sid);
     };
