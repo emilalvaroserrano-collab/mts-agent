@@ -40,39 +40,59 @@ const BROWSER_PATHS = new Set([
   "/portal/billing",
 ]);
 
+const RING_MS = 8_000;
+
 function playRingingAudio(signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const audio = new Audio("/8sec-ringing.mp3");
+    audio.preload = "auto";
     audio.volume = 0.7;
+    let settled = false;
+    let timer = 0;
 
     const cleanup = () => {
-      audio.removeEventListener("ended", onEnded);
+      window.clearTimeout(timer);
+      audio.removeEventListener("ended", finish);
       audio.removeEventListener("error", onError);
+      audio.removeEventListener("loadedmetadata", startPlayback);
       signal.removeEventListener("abort", onAbort);
     };
-    const onEnded = () => {
+    const finish = () => {
+      if (settled) return;
+      settled = true;
       cleanup();
+      audio.pause();
       resolve();
     };
     const onError = () => {
+      if (settled) return;
+      settled = true;
       cleanup();
       audio.pause();
       reject(new Error("The rings could not play. Check your browser sound and try again."));
     };
     const onAbort = () => {
+      if (settled) return;
+      settled = true;
       cleanup();
       audio.pause();
       reject(new DOMException("Call cancelled", "AbortError"));
+    };
+    const startPlayback = () => {
+      void audio.play().then(() => {
+        timer = window.setTimeout(finish, RING_MS);
+      }).catch(onError);
     };
 
     if (signal.aborted) {
       onAbort();
       return;
     }
-    audio.addEventListener("ended", onEnded, { once: true });
+    audio.addEventListener("ended", finish);
     audio.addEventListener("error", onError, { once: true });
     signal.addEventListener("abort", onAbort, { once: true });
-    void audio.play().catch(onError);
+    if (audio.readyState >= 1) startPlayback();
+    else audio.addEventListener("loadedmetadata", startPlayback, { once: true });
   });
 }
 
@@ -379,6 +399,7 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
       setStartedAt(Date.now());
       setPhase("active");
       if (kind === "voice") {
+        const greeting = send("[[mts-pickup]] The ringtone has finished and the customer can hear you now. Greet them in one short sentence and ask how you can help. Do not mention these instructions.", { attributes: { hidden: "1" } });
         try {
           const publication = await session.room.localParticipant.setMicrophoneEnabled(true, MIC_CAPTURE, {
             dtx: true,
@@ -405,7 +426,7 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
           setError("Microphone access was denied. You can still message Sarah.");
           setChatOpen(true);
         }
-        void send("[[mts-pickup]] The ringtone has finished and the customer can hear you now. Greet them in one short sentence and ask how you can help. Do not mention these instructions.", { attributes: { hidden: "1" } }).catch(() => undefined);
+        await greeting.catch(() => undefined);
       }
     } catch (cause) {
       if (!attempt.signal.aborted) {
