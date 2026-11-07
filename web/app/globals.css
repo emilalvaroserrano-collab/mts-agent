@@ -19,6 +19,8 @@ a { color: inherit; text-decoration: none; }
 .caller-heading h1 { font-size: clamp(40px, 6vw, 52px); font-weight: 600; line-height: 1.08; letter-spacing: -0.04em; margin: 0; color: #003970; }
 .caller-heading > span { display: block; font-size: 14px; color: #54595f; margin-top: 10px; }
 .caller-heading small { display: block; color: #127e86; font-variant-numeric: tabular-nums; font-size: 16px; margin-top: 16px; font-weight: 600; }
+.voice-bars { display: flex; align-items: flex-end; justify-content: center; gap: 5px; height: 56px; margin: 28px auto 0; width: min(280px, 78%); }
+.voice-bars span { display: block; flex: 1; height: 100%; transform-origin: bottom; border-radius: 999px; background: #1c9ea6; }
 .call-spacer { flex: 1; min-height: 15px; }
 .call-actions { padding: 0 36px 48px; }
 .secondary-actions, .primary-actions { display: flex; justify-content: space-between; align-items: center; }

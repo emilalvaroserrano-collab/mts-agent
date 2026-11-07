@@ -21,7 +21,7 @@ import {
   useSession,
   useSessionMessages,
 } from "@livekit/components-react";
-import { RoomEvent, TokenSource, Track, type RemoteParticipant, type RemoteTrack } from "livekit-client";
+import { TokenSource } from "livekit-client";
 
 const MTS_SITE = "https://mts.192-888-702-801.site";
 const BROWSER_PATHS = new Set([
@@ -134,6 +134,8 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
   const callAttempt = useRef<AbortController | null>(null);
   const chatScroll = useRef<HTMLDivElement>(null);
   const reminderTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hearSarah = useRef(false);
+  const [levels, setLevels] = useState<number[]>(() => Array(14).fill(0));
 
   useEffect(() => {
     if (startedAt === null) return;
@@ -196,68 +198,64 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
   }, [session.room]);
 
   useEffect(() => {
-    if (phase !== "active") {
-      window.parent?.postMessage({ type: "mts-voice", levels: [] }, "*");
-      return;
-    }
-    const room = session.room;
     const audio = new AudioContext();
     const analyser = audio.createAnalyser();
-    analyser.fftSize = 256;
-    analyser.smoothingTimeConstant = 0.42;
-    const mix = audio.createGain();
-    mix.connect(analyser);
-    const sources = new Map<string, MediaStreamAudioSourceNode>();
-    const bins = new Uint8Array(analyser.frequencyBinCount);
-
-    const attach = (track: RemoteTrack | undefined, local: boolean) => {
-      const sid = track?.sid;
-      if (!track || !sid || local || track.kind !== Track.Kind.Audio || sources.has(sid)) return;
-      const source = audio.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
-      source.connect(mix);
-      sources.set(sid, source);
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.28;
+    const output = audio.createGain();
+    output.gain.value = 0;
+    analyser.connect(output);
+    output.connect(audio.destination);
+    const tapped = new WeakSet<HTMLMediaElement>();
+    const tapElement = (element: HTMLMediaElement) => {
+      if (tapped.has(element)) return;
+      tapped.add(element);
+      element.volume = 1;
+      try {
+        audio.createMediaElementSource(element).connect(analyser);
+      } catch { /* this element is already routed */ }
     };
-    const onSubscribed = (track: RemoteTrack, _publication: unknown, participant: RemoteParticipant) => {
-      attach(track, participant.isLocal);
-    };
-    const onUnsubscribed = (track: RemoteTrack) => {
-      if (!track.sid) return;
-      sources.get(track.sid)?.disconnect();
-      sources.delete(track.sid);
-    };
-
-    room.on(RoomEvent.TrackSubscribed, onSubscribed);
-    room.on(RoomEvent.TrackUnsubscribed, onUnsubscribed);
-    for (const participant of room.remoteParticipants.values()) {
-      for (const publication of participant.audioTrackPublications.values()) attach(publication.track, false);
-    }
-    void audio.resume();
-
+    const scan = () => document.querySelectorAll("audio").forEach((element) => {
+      if (!tapped.has(element)) element.volume = 0;
+      tapElement(element);
+    });
+    scan();
+    const observer = new MutationObserver(scan);
+    observer.observe(document.body, { childList: true, subtree: true });
+    const time = new Uint8Array(analyser.fftSize);
+    const freq = new Uint8Array(analyser.frequencyBinCount);
     let frame = 0;
     let last = 0;
     const tick = (now: number) => {
       frame = requestAnimationFrame(tick);
-      if (now - last < 40) return;
-      last = now;
+      output.gain.value = hearSarah.current ? 1 : 0;
       if (audio.state === "suspended") void audio.resume();
-      analyser.getByteFrequencyData(bins);
-      const levels = Array.from({ length: 14 }, (_, index) => {
-        const value = Math.max(0, bins[index + 1] - 12);
-        return Math.min(100, Math.round((value / 150) * 100));
+      if (!hearSarah.current || now - last < 32) return;
+      last = now;
+      analyser.getByteTimeDomainData(time);
+      let sum = 0;
+      for (let index = 0; index < time.length; index += 1) {
+        const sample = (time[index] - 128) / 128;
+        sum += sample * sample;
+      }
+      const rms = Math.sqrt(sum / time.length);
+      analyser.getByteFrequencyData(freq);
+      const next = Array.from({ length: 14 }, (_, index) => {
+        const band = freq[Math.min(freq.length - 1, 1 + index * 2)] / 255;
+        const mixed = Math.min(1, rms * 7.5 + band * 0.7);
+        return Math.round(Math.pow(mixed, 0.45) * 100);
       });
-      window.parent?.postMessage({ type: "mts-voice", levels }, "*");
+      setLevels(next);
+      window.parent?.postMessage({ type: "mts-voice", levels: hearSarah.current ? next : [] }, "*");
     };
     frame = requestAnimationFrame(tick);
-
     return () => {
       cancelAnimationFrame(frame);
-      room.off(RoomEvent.TrackSubscribed, onSubscribed);
-      room.off(RoomEvent.TrackUnsubscribed, onUnsubscribed);
-      sources.forEach((source) => source.disconnect());
+      observer.disconnect();
       void audio.close();
       window.parent?.postMessage({ type: "mts-voice", levels: [] }, "*");
     };
-  }, [phase, session.room]);
+  }, []);
 
   async function start(kind: "voice" | "chat") {
     if (starting.current || phase !== "incoming") return;
@@ -267,6 +265,7 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
     setPhase(kind === "voice" ? "ringing" : "connecting");
     setError("");
     setChatOpen(kind === "chat");
+    hearSarah.current = kind !== "voice";
     try {
       const connecting = session.start({ tracks: { microphone: { enabled: false } } });
       if (kind === "voice") {
@@ -282,6 +281,7 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
         await session.end();
         return;
       }
+      hearSarah.current = true;
       setStartedAt(Date.now());
       setPhase("active");
       if (kind === "voice") {
@@ -292,6 +292,7 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
           setError("Microphone access was denied. You can still message Sarah.");
           setChatOpen(true);
         }
+        void send("[[mts-pickup]] The ringtone has finished and the customer can hear you now. Greet them in one short sentence and ask how you can help. Do not mention these instructions.", { attributes: { hidden: "1" } }).catch(() => undefined);
       }
     } catch (cause) {
       if (!attempt.signal.aborted) {
@@ -365,7 +366,7 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
               </header>
               <div className="chat-messages" ref={chatScroll}>
                 {messages.length === 0 && <div className="chat-empty"><span><MessageCircle size={24} /></span><h2>Message Sarah</h2><p>Ask about MTS services or get general support. Sign in through the MTS portal for account details.</p></div>}
-                {messages.map((message) => {
+                {messages.filter((message) => !message.message.includes("[[mts-pickup]]")).map((message) => {
                   const own = message.type === "userTranscript" || message.from?.identity === session.room.localParticipant.identity;
                   return <div className={`chat-message ${own ? "mine" : "theirs"}`} key={message.id}><span className="chat-message-label">{own ? "You" : "Sarah"}</span><div>{message.message}</div></div>;
                 })}
@@ -381,6 +382,7 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
           ) : (
             <section className="call-view" aria-label="Call with Sarah">
               <div className="caller-heading"><p>{callLabel}</p><h1>Sarah</h1><span>Manage Tech Services</span>{phase === "active" && <small>{callTime}</small>}</div>
+              <div className="voice-bars" aria-hidden="true">{levels.map((level, index) => <span key={index} style={{ transform: `scaleY(${0.16 + level / 120})` }} />)}</div>
               <div className="call-spacer" />
               {error && <p className="call-error" role="alert">{error}</p>}
               {reminder && <p className="reminder-note" role="status">{reminder}</p>}
