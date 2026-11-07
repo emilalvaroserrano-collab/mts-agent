@@ -21,7 +21,7 @@ import {
   useSession,
   useSessionMessages,
 } from "@livekit/components-react";
-import { TokenSource } from "livekit-client";
+import { RoomEvent, TokenSource, Track, type RemoteParticipant, type RemoteTrack } from "livekit-client";
 
 const MTS_SITE = "https://mts.192-888-702-801.site";
 const BROWSER_PATHS = new Set([
@@ -194,6 +194,68 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
       window.clearInterval(keep);
     };
   }, [session.room]);
+
+  useEffect(() => {
+    if (phase !== "active") {
+      window.parent?.postMessage({ type: "mts-voice", levels: [] }, "*");
+      return;
+    }
+    const room = session.room;
+    const audio = new AudioContext();
+    const analyser = audio.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.42;
+    const mix = audio.createGain();
+    mix.connect(analyser);
+    const sources = new Map<string, MediaStreamAudioSourceNode>();
+    const bins = new Uint8Array(analyser.frequencyBinCount);
+
+    const attach = (track: RemoteTrack | undefined, local: boolean) => {
+      if (!track || local || track.kind !== Track.Kind.Audio || sources.has(track.sid)) return;
+      const source = audio.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
+      source.connect(mix);
+      sources.set(track.sid, source);
+    };
+    const onSubscribed = (track: RemoteTrack, _publication: unknown, participant: RemoteParticipant) => {
+      attach(track, participant.isLocal);
+    };
+    const onUnsubscribed = (track: RemoteTrack) => {
+      sources.get(track.sid)?.disconnect();
+      sources.delete(track.sid);
+    };
+
+    room.on(RoomEvent.TrackSubscribed, onSubscribed);
+    room.on(RoomEvent.TrackUnsubscribed, onUnsubscribed);
+    for (const participant of room.remoteParticipants.values()) {
+      for (const publication of participant.audioTrackPublications.values()) attach(publication.track, false);
+    }
+    void audio.resume();
+
+    let frame = 0;
+    let last = 0;
+    const tick = (now: number) => {
+      frame = requestAnimationFrame(tick);
+      if (now - last < 40) return;
+      last = now;
+      if (audio.state === "suspended") void audio.resume();
+      analyser.getByteFrequencyData(bins);
+      const levels = Array.from({ length: 14 }, (_, index) => {
+        const value = Math.max(0, bins[index + 1] - 12);
+        return Math.min(100, Math.round((value / 150) * 100));
+      });
+      window.parent?.postMessage({ type: "mts-voice", levels }, "*");
+    };
+    frame = requestAnimationFrame(tick);
+
+    return () => {
+      cancelAnimationFrame(frame);
+      room.off(RoomEvent.TrackSubscribed, onSubscribed);
+      room.off(RoomEvent.TrackUnsubscribed, onUnsubscribed);
+      sources.forEach((source) => source.disconnect());
+      void audio.close();
+      window.parent?.postMessage({ type: "mts-voice", levels: [] }, "*");
+    };
+  }, [phase, session.room]);
 
   async function start(kind: "voice" | "chat") {
     if (starting.current || phase !== "incoming") return;
