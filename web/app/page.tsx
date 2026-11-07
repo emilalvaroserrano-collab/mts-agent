@@ -21,7 +21,7 @@ import {
   useSession,
   useSessionMessages,
 } from "@livekit/components-react";
-import { TokenSource } from "livekit-client";
+import { RoomEvent, TokenSource, Track, type RemoteAudioTrack, type RemoteParticipant, type RemoteTrack } from "livekit-client";
 
 const MTS_SITE = "https://mts.192-888-702-801.site";
 const BROWSER_PATHS = new Set([
@@ -198,64 +198,82 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
   }, [session.room]);
 
   useEffect(() => {
+    const room = session.room;
     const audio = new AudioContext();
     const analyser = audio.createAnalyser();
     analyser.fftSize = 512;
-    analyser.smoothingTimeConstant = 0.28;
-    const output = audio.createGain();
-    output.gain.value = 0;
-    analyser.connect(output);
-    output.connect(audio.destination);
-    const tapped = new WeakSet<HTMLMediaElement>();
-    const tapElement = (element: HTMLMediaElement) => {
-      if (tapped.has(element)) return;
-      tapped.add(element);
-      element.volume = 1;
+    analyser.smoothingTimeConstant = 0.25;
+    const wired = new Set<string>();
+    const tracks = new Set<RemoteAudioTrack>();
+    let audible = false;
+
+    const wire = (track: RemoteTrack | undefined) => {
+      if (!track || track.kind !== Track.Kind.Audio || track.attachedElements.length === 0) return;
+      const audioTrack = track as RemoteAudioTrack;
+      const key = audioTrack.sid ?? audioTrack.mediaStreamTrack.id;
+      if (wired.has(key)) return;
       try {
-        audio.createMediaElementSource(element).connect(analyser);
-      } catch { /* this element is already routed */ }
+        audioTrack.setAudioContext(audio);
+        audioTrack.setWebAudioPlugins([analyser]);
+        audioTrack.setVolume(hearSarah.current ? 1 : 0);
+      } catch {
+        return;
+      }
+      wired.add(key);
+      tracks.add(audioTrack);
+      void audio.resume();
     };
-    const scan = () => document.querySelectorAll("audio").forEach((element) => {
-      if (!tapped.has(element)) element.volume = 0;
-      tapElement(element);
-    });
-    scan();
-    const observer = new MutationObserver(scan);
-    observer.observe(document.body, { childList: true, subtree: true });
+    const onSubscribed = (track: RemoteTrack, _publication: unknown, participant: RemoteParticipant) => {
+      if (!participant.isLocal) wire(track);
+    };
+    room.on(RoomEvent.TrackSubscribed, onSubscribed);
+    const scan = window.setInterval(() => {
+      for (const participant of room.remoteParticipants.values()) {
+        for (const publication of participant.audioTrackPublications.values()) wire(publication.track);
+      }
+      if (audible !== hearSarah.current) {
+        audible = hearSarah.current;
+        for (const track of tracks) track.setVolume(audible ? 1 : 0);
+      }
+    }, 200);
+
     const time = new Uint8Array(analyser.fftSize);
     const freq = new Uint8Array(analyser.frequencyBinCount);
-    let frame = 0;
     let last = 0;
     const tick = (now: number) => {
-      frame = requestAnimationFrame(tick);
-      output.gain.value = hearSarah.current ? 1 : 0;
-      if (audio.state === "suspended") void audio.resume();
-      if (!hearSarah.current || now - last < 32) return;
-      last = now;
-      analyser.getByteTimeDomainData(time);
-      let sum = 0;
-      for (let index = 0; index < time.length; index += 1) {
-        const sample = (time[index] - 128) / 128;
-        sum += sample * sample;
+      if (audible !== hearSarah.current) {
+        audible = hearSarah.current;
+        for (const track of tracks) track.setVolume(audible ? 1 : 0);
       }
-      const rms = Math.sqrt(sum / time.length);
-      analyser.getByteFrequencyData(freq);
-      const next = Array.from({ length: 14 }, (_, index) => {
-        const band = freq[Math.min(freq.length - 1, 1 + index * 2)] / 255;
-        const mixed = Math.min(1, rms * 7.5 + band * 0.7);
-        return Math.round(Math.pow(mixed, 0.45) * 100);
-      });
-      setLevels(next);
-      window.parent?.postMessage({ type: "mts-voice", levels: hearSarah.current ? next : [] }, "*");
+      if (audio.state === "suspended") void audio.resume();
+      if (hearSarah.current && now - last >= 32) {
+        last = now;
+        analyser.getByteTimeDomainData(time);
+        let sum = 0;
+        for (let index = 0; index < time.length; index += 1) {
+          const sample = (time[index] - 128) / 128;
+          sum += sample * sample;
+        }
+        const rms = Math.sqrt(sum / time.length);
+        analyser.getByteFrequencyData(freq);
+        const next = Array.from({ length: 14 }, (_, index) => {
+          const band = freq[Math.min(freq.length - 1, index + 1)] / 255;
+          return Math.min(100, Math.round((rms * 12 + band * 1.4) * 100));
+        });
+        setLevels(next);
+        window.parent?.postMessage({ type: "mts-voice", levels: next }, "*");
+      }
     };
-    frame = requestAnimationFrame(tick);
+    const meter = window.setInterval(() => tick(performance.now()), 32);
     return () => {
-      cancelAnimationFrame(frame);
-      observer.disconnect();
+      window.clearInterval(scan);
+      window.clearInterval(meter);
+      room.off(RoomEvent.TrackSubscribed, onSubscribed);
+      for (const track of tracks) track.setWebAudioPlugins([]);
       void audio.close();
       window.parent?.postMessage({ type: "mts-voice", levels: [] }, "*");
     };
-  }, []);
+  }, [session.room]);
 
   async function start(kind: "voice" | "chat") {
     if (starting.current || phase !== "incoming") return;
