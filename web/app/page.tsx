@@ -146,6 +146,15 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
   }, [messages.length, chatOpen]);
 
   useEffect(() => {
+    return () => {
+      callAttempt.current?.abort();
+      void session.end();
+    };
+    // End the call only when this screen goes away.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     const room = session.room;
     room.registerRpcMethod("mts.openWebsite", async (data) => {
       const path = JSON.parse(data.payload)?.path;
@@ -156,10 +165,8 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
       return JSON.stringify({ ready: true, path });
     });
     return () => {
-      callAttempt.current?.abort();
       room.unregisterRpcMethod("mts.openWebsite");
       if (reminderTimer.current) clearTimeout(reminderTimer.current);
-      void session.end();
     };
     // The Room instance is stable for this call.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -197,12 +204,16 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
     setError("");
     setChatOpen(kind === "chat");
     try {
+      const connecting = session.start({ tracks: { microphone: { enabled: false } } });
       if (kind === "voice") {
         await playRingingAudio(attempt.signal);
-        if (attempt.signal.aborted) return;
-        setPhase("connecting");
+        if (attempt.signal.aborted) {
+          await connecting.catch(() => undefined);
+          await session.end();
+          return;
+        }
       }
-      await session.start({ tracks: { microphone: { enabled: false } } });
+      await connecting;
       if (attempt.signal.aborted) {
         await session.end();
         return;

@@ -601,7 +601,7 @@ class OperatorAgent(DefaultAgent):
 server = AgentServer()
 
 
-@server.rtc_session(agent_name="mts-agent")
+@server.rtc_session(agent_name="mts-agent-ai")
 async def entrypoint(ctx: JobContext):
     try:
         metadata = json.loads(ctx.job.metadata or "{}")

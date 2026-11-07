@@ -63,7 +63,7 @@ export async function POST(request: NextRequest) {
   token.addGrant({ roomJoin: true, room, canPublish: true, canPublishData: true, canSubscribe: true });
   token.roomConfig = new RoomConfiguration({
     agents: [new RoomAgentDispatch({
-      agentName: "mts-agent",
+      agentName: "mts-agent-ai",
       metadata: JSON.stringify(customer
         ? {
             mts_customer_id: customer.id,
