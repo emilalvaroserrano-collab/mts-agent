@@ -156,6 +156,11 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
   const reminderTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hearSarah = useRef(false);
   const [levels, setLevels] = useState<number[]>(() => Array(14).fill(0));
+  const [embedded, setEmbedded] = useState(false);
+
+  useEffect(() => {
+    setEmbedded(window.parent !== window);
+  }, []);
 
   useEffect(() => {
     if (startedAt === null) return;
@@ -466,7 +471,7 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
     <main className="call-page">
       <div className="phone" aria-label="MTS support call">
         <div className="phone-screen">
-          {window.parent !== window ? <button type="button" className="hide-call" onClick={() => window.parent.postMessage({ type: "mts-minimize" }, "*")}>Hide</button> : null}
+          {embedded ? <button type="button" className="hide-call" onClick={() => window.parent.postMessage({ type: "mts-minimize" }, "*")}>Hide</button> : null}
           {chatOpen ? null : <div className="status-bar" aria-hidden="true"><span className="dynamic-island" /></div>}
 
           {chatOpen ? (
@@ -474,7 +479,7 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
               <header className="chat-header">
                 <button className="header-button" onClick={() => setChatOpen(false)} aria-label="Back to call"><ArrowLeft size={23} /></button>
                 <div className="chat-contact"><span className="chat-avatar"><AudioLines size={20} /></span><span><strong>Sarah</strong><small>MTS Customer Support</small></span></div>
-                <button className="header-button" onClick={() => { if (window.parent !== window) window.parent.postMessage({ type: "mts-minimize" }, "*"); else void endCall(); }} aria-label="Hide conversation"><X size={21} /></button>
+                <button className="header-button" onClick={() => { if (embedded) window.parent.postMessage({ type: "mts-minimize" }, "*"); else void endCall(); }} aria-label="Hide conversation"><X size={21} /></button>
               </header>
               <div className="chat-messages" ref={chatScroll}>
                 {messages.length === 0 && <div className="chat-empty"><span><MessageCircle size={24} /></span><h2>Message Sarah</h2><p>Ask about MTS services or get general support. Sign in through the MTS portal for account details.</p></div>}
