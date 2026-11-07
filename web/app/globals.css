@@ -11,6 +11,7 @@ a { color: inherit; text-decoration: none; }
 .phone { width: min(416px, 100%); height: min(830px, calc(100svh - 32px)); min-height: 620px; padding: 0; border-radius: 28px; background: #ffffff; border: 1px solid #d5e4e6; box-shadow: 0 16px 40px rgba(0, 57, 112, 0.12); }
 .phone-screen { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; border-radius: 28px; color: #003970; background: linear-gradient(180deg, #e5f6f7 0%, #ffffff 28%); }
 .status-bar { height: 28px; }
+.hide-call { position: absolute; top: 14px; right: 16px; z-index: 2; border: 0; background: transparent; color: #54595f; font-size: 13px; font-weight: 600; }
 .dynamic-island, .home-indicator { display: none; }
 
 .call-view { flex: 1; min-height: 0; display: flex; flex-direction: column; }

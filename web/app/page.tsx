@@ -240,17 +240,31 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
     let quietFrames = 0;
     let appliedVolume = -1;
 
+    const tapped = new WeakSet<HTMLMediaElement>();
     const wireSpeaker = (track: RemoteTrack | undefined) => {
       if (!track || track.kind !== Track.Kind.Audio) return;
       const audioTrack = track as RemoteAudioTrack;
       const key = audioTrack.sid ?? audioTrack.mediaStreamTrack.id;
       if (wired.has(key)) return;
+      speakers.add(audioTrack);
       try {
-        const source = audio.createMediaStreamSource(new MediaStream([audioTrack.mediaStreamTrack]));
-        source.connect(speakerMeter);
+        const clone = audioTrack.mediaStreamTrack.clone();
+        audio.createMediaStreamSource(new MediaStream([clone])).connect(speakerMeter);
         wired.add(key);
-        speakers.add(audioTrack);
-      } catch { /* the track is not readable yet */ }
+      } catch { /* the element tap below still meters what is playing */ }
+    };
+    const wireElements = () => {
+      document.querySelectorAll("audio").forEach((element) => {
+        if (tapped.has(element)) return;
+        const capture = (element as HTMLAudioElement & { captureStream?: () => MediaStream }).captureStream?.bind(element);
+        if (!capture) return;
+        try {
+          const stream = capture();
+          if (stream.getAudioTracks().length === 0) return;
+          audio.createMediaStreamSource(stream).connect(speakerMeter);
+          tapped.add(element);
+        } catch { /* the element is not playing yet */ }
+      });
     };
     const wireMic = () => {
       const publication = room.localParticipant.getTrackPublication(Track.Source.Microphone);
@@ -270,6 +284,7 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
         for (const publication of participant.audioTrackPublications.values()) wireSpeaker(publication.track);
       }
       wireMic();
+      wireElements();
     }, 250);
 
     const speakerTime = new Uint8Array(speakerMeter.fftSize);
@@ -451,16 +466,15 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
     <main className="call-page">
       <div className="phone" aria-label="MTS support call">
         <div className="phone-screen">
-          <div className="status-bar" aria-hidden="true">
-            <span className="dynamic-island" />
-          </div>
+          {window.parent !== window ? <button type="button" className="hide-call" onClick={() => window.parent.postMessage({ type: "mts-minimize" }, "*")}>Hide</button> : null}
+          {chatOpen ? null : <div className="status-bar" aria-hidden="true"><span className="dynamic-island" /></div>}
 
           {chatOpen ? (
             <section className="chat-view" aria-label="Chat with Sarah">
               <header className="chat-header">
                 <button className="header-button" onClick={() => setChatOpen(false)} aria-label="Back to call"><ArrowLeft size={23} /></button>
                 <div className="chat-contact"><span className="chat-avatar"><AudioLines size={20} /></span><span><strong>Sarah</strong><small>MTS Customer Support</small></span></div>
-                <button className="header-button" onClick={endCall} aria-label="End conversation"><X size={21} /></button>
+                <button className="header-button" onClick={() => { if (window.parent !== window) window.parent.postMessage({ type: "mts-minimize" }, "*"); else void endCall(); }} aria-label="Hide conversation"><X size={21} /></button>
               </header>
               <div className="chat-messages" ref={chatScroll}>
                 {messages.length === 0 && <div className="chat-empty"><span><MessageCircle size={24} /></span><h2>Message Sarah</h2><p>Ask about MTS services or get general support. Sign in through the MTS portal for account details.</p></div>}
