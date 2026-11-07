@@ -53,7 +53,7 @@ Always verify the result of every action before claiming it succeeded. End compl
 This session was explicitly dispatched as an allowlisted MTS operator. You may use find_mts_customers to locate a customer and select_mts_customer to bind one exact result before reading or editing that customer's data. Confirm the intended person and consequential changes. create_mts_customer emails a verification code. delete_mts_customer is permanent and requires explicit confirmation naming the selected customer. Do not select a customer from a guessed ID or a spoken email alone."""
     elif customer_id is not None and email:
         scope = """[Verified customer dispatch]
-Trusted dispatch supplied a customer ID and email. Call getMe to confirm that the API record matches before accessing account data. Scope every account tool to that verified customer. Do not offer unsupported checkout or payment actions."""
+Trusted dispatch supplied a customer ID and email. The customer's profile is already bound to this session — call getMe at session start to load it, then use the customer's name and account data proactively. Never ask the customer for their email, name, or account ID; that information is already available from the dispatch. Call getMe to confirm that the API record matches before accessing account data. Scope every account tool to that verified customer. Do not offer unsupported checkout or payment actions."""
     else:
         scope = """[Guest session]
 This session has no verified customer account. Offer general support and help the caller navigate to the MTS portal. Do not offer to check tickets, orders, billing, or account details in this session. If asked, explain that the caller needs to sign in through the MTS portal first. Do not suggest that a spoken email can unlock access."""
@@ -346,12 +346,26 @@ class DefaultAgent(Agent):
         return {"browser": response, "note": "A link is ready for the visitor to open"}
 
     async def on_enter(self):
+        # Proactively load the bound customer profile so Sarah never asks
+        # for information already available from trusted dispatch.
+        profile = None
+        if self.customer_id is not None and self.email:
+            profile = await self.get_me()
+
         if self.operator:
             greeting = "Welcome to Manage Tech Services. I'm Sarah, your support agent. I can look up customers, create accounts, manage tickets, orders, services, and billing. What would you like to do first?"
+        elif (
+            profile
+            and not profile.get("error")
+            and self.customer_id is not None
+            and self.email
+        ):
+            name = profile.get("name") or str(profile.get("email", "")).split("@")[0]
+            greeting = f"Welcome back, {name}. I'm Sarah, your support agent. Your account is linked to this session. I can check your tickets and orders, update your profile, order services, file complaints, read notices, and more. What can I help you with today?"
         elif self.customer_id is not None and self.email:
-            greeting = "Welcome to Manage Tech Services. I'm Sarah, your support agent. I can check your tickets and orders, update your profile, order services, file complaints, read notices, and more. What can I help you with today?"
+            greeting = "Welcome to Manage Tech Services. I'm Sarah, your support agent. Your account is linked to this session. I can check your tickets and orders, update your profile, order services, file complaints, read notices, and more. What can I help you with today?"
         else:
-            greeting = "Welcome to Manage Tech Services. I'm Sarah, your support agent. I can answer general questions and point you to the right MTS pages. If you need to check tickets, orders, billing, or your account, please let me know your email address or your full name so I can guide you properly.. What would you like help with?"
+            greeting = "Welcome to Manage Tech Services. I'm Sarah, your support agent. This is a guest session. I can answer general questions and point you to the right MTS pages. If you need to check tickets, orders, billing, or your account, please sign in through the MTS portal first. What would you like help with?"
         await self.session.generate_reply(
             instructions=greeting,
             allow_interruptions=True,

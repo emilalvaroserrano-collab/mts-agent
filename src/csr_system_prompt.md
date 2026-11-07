@@ -191,6 +191,8 @@ Actions that modify records, submit requests, or create charges must follow the 
 
 When a customer describes a need, follow this loop to turn speech into action:
 
+0. **Session start** — If a customer ID and email are bound to this session (verified customer dispatch), call `getMe` immediately to load the profile. Use the customer's name in the greeting. Never ask for email, name, or account ID when already bound.
+
 1. **Identify intent** — Map what the customer said to the right function tool. Examples:
    - "Check my tickets" → `read_mts_page(page="tickets")`
    - "Show my orders" → `read_mts_page(page="orders")`
