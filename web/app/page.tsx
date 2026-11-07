@@ -1,6 +1,8 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { SupportProvider, ConversationHistory, NotificationButton, NoticeBanner, useSupport, type SupportIdentity } from "./support";
+
+import { FormEvent, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   AlarmClock,
   ArrowLeft,
@@ -23,6 +25,10 @@ import {
 } from "@livekit/components-react";
 import { AudioPresets, Room, RoomEvent, TokenSource, Track, type LocalAudioTrack, type RemoteAudioTrack, type RemoteParticipant, type RemoteTrack } from "livekit-client";
 
+const subscribeEmbedded = () => () => {};
+const embeddedSnapshot = () => window.parent !== window;
+const embeddedServerSnapshot = () => false;
+
 const MTS_SITE = "https://mts.192-888-702-801.site";
 const MIC_CAPTURE = {
   echoCancellation: true,
@@ -38,6 +44,10 @@ const BROWSER_PATHS = new Set([
   "/portal/tickets",
   "/portal/orders",
   "/portal/billing",
+  "/portal/account",
+  "/portal/organization",
+  "/portal/notifications",
+  "/portal/my-services",
 ]);
 
 const RING_MS = 8_000;
@@ -101,38 +111,42 @@ export default function Page() {
   return <SupportCall key={sessionNumber} onRestart={() => setSessionNumber((n) => n + 1)} />;
 }
 
-function SupportCall({ onRestart }: { onRestart: () => void }) {
-  const handoff = useRef("");
-  useEffect(() => {
-    function onMessage(event: MessageEvent) {
-      if (event.data?.type !== "mts-user" || typeof event.data.code !== "string") return;
-      handoff.current = event.data.code.slice(0, 80);
-    }
-    window.addEventListener("message", onMessage);
-    window.parent?.postMessage({ type: "mts-agent-ready" }, "*");
-    return () => window.removeEventListener("message", onMessage);
-  }, []);
-  const tokenSource = useMemo(
-    () =>
-      TokenSource.custom(async () => {
+function createSupportTokenSource(handoff: { code: string; page: string }, setIdentity: (identity: SupportIdentity | null) => void) {
+  return TokenSource.custom(async () => {
         const started = Date.now();
-        while (!handoff.current && Date.now() - started < 2500) {
+        while (!handoff.code && Date.now() - started < 2500) {
           await new Promise((resolve) => setTimeout(resolve, 100));
         }
         const response = await fetch("/api/token", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code: handoff.current }),
+          body: JSON.stringify({ code: handoff.code, page: handoff.page }),
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "The call could not connect.");
+        setIdentity(data.support || null);
         return {
           serverUrl: data.serverUrl || data.server_url,
           participantToken: data.participantToken || data.participant_token,
         };
-      }),
-    [],
-  );
+      });
+}
+
+function SupportCall({ onRestart }: { onRestart: () => void }) {
+  const handoff = useMemo(() => ({ code: "", page: "/portal" }), []);
+  const [identity, setIdentity] = useState<SupportIdentity | null>(null);
+  useEffect(() => {
+    function onMessage(event: MessageEvent) {
+      if (event.source !== window.parent || !new Set((process.env.NEXT_PUBLIC_MTS_PORTAL_ORIGINS || "https://mts.192-888-702-801.site,https://access.virtualcloudgroup.com").split(",")).has(event.origin)) return;
+      if (event.data?.type !== "mts-user" || typeof event.data.code !== "string") return;
+      handoff.code = event.data.code.slice(0, 80);
+      if (typeof event.data.page === "string" && BROWSER_PATHS.has(event.data.page)) handoff.page = event.data.page;
+    }
+    window.addEventListener("message", onMessage);
+    window.parent?.postMessage({ type: "mts-agent-ready" }, "*");
+    return () => window.removeEventListener("message", onMessage);
+  }, [handoff]);
+  const tokenSource = useMemo(() => createSupportTokenSource(handoff, setIdentity), [handoff]);
   const room = useMemo(
     () =>
       new Room({
@@ -147,11 +161,22 @@ function SupportCall({ onRestart }: { onRestart: () => void }) {
     [],
   );
   const session = useSession(tokenSource, { room });
+  useEffect(() => {
+    const publishPage = () => { if(session.room.state === "connected") void session.room.localParticipant.setAttributes({"mts.page":handoff.page}); };
+    const onPage = (event: MessageEvent) => {
+      if(event.source!==window.parent||!new Set((process.env.NEXT_PUBLIC_MTS_PORTAL_ORIGINS||"https://mts.192-888-702-801.site,https://access.virtualcloudgroup.com").split(",")).has(event.origin))return;
+      if(event.data?.type==="mts-page"&&typeof event.data.path==="string"&&BROWSER_PATHS.has(event.data.path)){handoff.page=event.data.path;publishPage();}
+    };
+    session.room.on(RoomEvent.Connected,publishPage);window.addEventListener("message",onPage);
+    return()=>{session.room.off(RoomEvent.Connected,publishPage);window.removeEventListener("message",onPage);};
+  },[session.room,handoff]);
 
   return (
     <SessionProvider session={session}>
-      <CallSurface session={session} onRestart={onRestart} />
-      <RoomAudioRenderer />
+      <SupportProvider identity={identity} room={session.room}>
+        <CallSurface session={session} onRestart={onRestart} />
+        <RoomAudioRenderer />
+      </SupportProvider>
     </SessionProvider>
   );
 }
@@ -159,6 +184,7 @@ function SupportCall({ onRestart }: { onRestart: () => void }) {
 type Session = ReturnType<typeof useSession>;
 
 function CallSurface({ session, onRestart }: { session: Session; onRestart: () => void }) {
+  const { identity } = useSupport();
   const agent = useAgent(session);
   const { messages, send, isSending } = useSessionMessages(session);
   const [phase, setPhase] = useState<"incoming" | "ringing" | "connecting" | "active" | "ended">("incoming");
@@ -176,11 +202,7 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
   const reminderTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hearSarah = useRef(false);
   const [levels, setLevels] = useState<number[]>(() => Array(14).fill(0));
-  const [embedded, setEmbedded] = useState(false);
-
-  useEffect(() => {
-    setEmbedded(window.parent !== window);
-  }, []);
+  const embedded = useSyncExternalStore(subscribeEmbedded, embeddedSnapshot, embeddedServerSnapshot);
 
   useEffect(() => {
     if (startedAt === null) return;
@@ -189,7 +211,8 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
   }, [startedAt]);
 
   useEffect(() => {
-    if (chatScroll.current) chatScroll.current.scrollTop = chatScroll.current.scrollHeight;
+    const element = chatScroll.current;
+    if (element && element.scrollHeight - element.scrollTop - element.clientHeight < 180) element.scrollTop = element.scrollHeight;
   }, [messages.length, chatOpen]);
 
   useEffect(() => {
@@ -204,19 +227,30 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
   useEffect(() => {
     const room = session.room;
     room.registerRpcMethod("mts.openWebsite", async (data) => {
+      if (!room.remoteParticipants.get(data.callerIdentity)?.isAgent) throw new Error("Only Sarah can request navigation");
       const path = JSON.parse(data.payload)?.path;
       if (typeof path !== "string" || !BROWSER_PATHS.has(path)) {
         throw new Error("Unsupported MTS page");
       }
       setBrowserPath(path);
-      return JSON.stringify({ ready: true, path });
+      if(window.parent!==window){
+        return await new Promise<string>(resolve=>{
+          const receive=(event:MessageEvent)=>{
+            if(event.source!==window.parent||!new Set((process.env.NEXT_PUBLIC_MTS_PORTAL_ORIGINS||"https://mts.192-888-702-801.site,https://access.virtualcloudgroup.com").split(",")).has(event.origin))return;
+            if(event.data?.type==="mts-navigated"&&event.data.path===path){window.removeEventListener("message",receive);clearTimeout(timer);resolve(JSON.stringify({navigated:true,path}));}
+          };
+          const timer=setTimeout(()=>{window.removeEventListener("message",receive);resolve(JSON.stringify({navigated:false,linkReady:true,path}));},3500);
+          window.addEventListener("message",receive);
+          for(const origin of (process.env.NEXT_PUBLIC_MTS_PORTAL_ORIGINS||"https://mts.192-888-702-801.site,https://access.virtualcloudgroup.com").split(","))window.parent.postMessage({type:"mts-navigate",path},origin);
+        });
+      }
+      return JSON.stringify({ navigated:false,linkReady:true,path });
     });
     return () => {
       room.unregisterRpcMethod("mts.openWebsite");
       if (reminderTimer.current) clearTimeout(reminderTimer.current);
     };
     // The Room instance is stable for this call.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.room]);
 
   useEffect(() => {
@@ -259,7 +293,6 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
     const wired = new Set<string>();
     const speakers = new Set<RemoteAudioTrack>();
     let micSource: MediaStreamAudioSourceNode | null = null;
-    let audible = false;
     let userSpeaking = false;
     let voiceFrames = 0;
     let quietFrames = 0;
@@ -340,7 +373,6 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
       const volume = !hearSarah.current ? 0 : userSpeaking ? 0.08 : 1;
       if (volume !== appliedVolume) {
         appliedVolume = volume;
-        audible = hearSarah.current;
         for (const track of speakers) track.setVolume(volume);
       }
       if (!hearSarah.current || now - last < 32) return;
@@ -502,9 +534,13 @@ function CallSurface({ session, onRestart }: { session: Session; onRestart: () =
                 <div className="chat-contact"><span className="chat-avatar"><AudioLines size={20} /></span><span><strong>Sarah</strong><small>MTS Customer Support</small></span></div>
                 <button className="header-button" onClick={() => { if (embedded) window.parent.postMessage({ type: "mts-minimize" }, "*"); else void endCall(); }} aria-label="Hide conversation"><X size={21} /></button>
               </header>
+              <ConversationHistory />
+              <NoticeBanner />
+              <NotificationButton />
               <div className="chat-messages" ref={chatScroll}>
+                {identity?.previousMessages.map((message) => <div className={`chat-message ${message.role === "user" ? "mine" : "theirs"}`} key={`saved-${message.id}`}><span className="chat-message-label">{message.role === "user" ? "You" : "Sarah"} · {new Date(message.created_at).toLocaleDateString()}</span><div>{message.body}</div></div>)}
                 {messages.length === 0 && <div className="chat-empty"><span><MessageCircle size={24} /></span><h2>Message Sarah</h2><p>Ask about MTS services or get general support. Sign in through the MTS portal for account details.</p></div>}
-                {messages.filter((message) => !message.message.includes("[[mts-pickup]]")).map((message) => {
+                {messages.filter((message) => !message.message.includes("[[mts-")).map((message) => {
                   const own = message.type === "userTranscript" || message.from?.identity === session.room.localParticipant.identity;
                   return <div className={`chat-message ${own ? "mine" : "theirs"}`} key={message.id}><span className="chat-message-label">{own ? "You" : "Sarah"}</span><div>{message.message}</div></div>;
                 })}

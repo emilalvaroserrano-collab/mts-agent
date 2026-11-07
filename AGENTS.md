@@ -38,7 +38,7 @@ The Next.js app in `web/` deploys to Vercel:
    - `LIVEKIT_API_SECRET`
    - `CSR_ENABLE_GUEST_ACCESS=true` — only if you want anonymous visitors to start support calls
 3. **Do NOT** set `MTS_SUPER_ADMIN_KEY` on Vercel — that belongs to the Python worker only.
-4. Connect the GitHub repo and deploy. The token route at `/api/token` issues short-lived guest tokens; it ignores client-supplied identity, room, and metadata.
+4. Connect the GitHub repo and deploy. The token route at `/api/token` redeems a one-time portal handoff into a customer-scoped support token and conversation. Without a valid handoff it allows guest tokens only when explicitly enabled. It never trusts a browser-supplied customer identity, room, or privilege.
 5. Protect or rate-limit the public token endpoint before enabling it on an unrestricted public domain — each call consumes LiveKit resources.
 
 ### Python worker — LiveKit Cloud (separate deployment)
@@ -55,5 +55,5 @@ Deploy the Python worker via the `Dockerfile` to LiveKit Cloud — it needs pers
 
 - Tests import `from agent import ...` (the project loads editable via `uv run`; `src/` is the package root per `pyproject.toml`).
 - In tests, call registered tools through `_func` (see `tests/test_mts_tools.py`).
-- Customer tools require trusted dispatch metadata with both `mts_customer_id` and `email`; a spoken email never authenticates. Operator tools additionally require `MTS_OPERATOR_EMAIL_ALLOWLIST` and `"mts_operator": true` in dispatch metadata — clients must not supply either.
+- Customer tools require trusted dispatch metadata with `mts_customer_id`, `email`, `mts_session_token`, and `conversation_id` from the redeemed portal handoff; a spoken email never authenticates. Operator tools additionally require `MTS_OPERATOR_EMAIL_ALLOWLIST` and `"mts_operator": true` in dispatch metadata — clients must not supply either.
 - See `README.md` for the full run/deploy guide and LiveKit docs (`lk docs`).
