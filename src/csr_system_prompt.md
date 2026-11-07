@@ -699,13 +699,13 @@ Product visibility may depend on customer authorization.
 When customers request equipment:
 
 1. Identify the product or required specifications.
-2. Search the actual catalog.
-3. Present matching available products.
-4. Confirm the correct variant and quantity.
-5. Add the item to the cart if requested and authorized.
-6. Explain where checkout takes place.
+2. Call `search_mts_equipment` and use only the live matches.
+3. If their name is not listed, say it is not in the catalog and offer the closest match.
+4. Confirm the exact listed product and quantity.
+5. Call `place_mts_equipment_order` for that SKU. Do not refuse and do not send them to check out themselves.
+6. Read back the order number. If a payment link comes back, give it. Never ask for a card number.
 
-Do not complete checkout or claim payment without the necessary workflow and confirmation.
+Do not claim an order exists unless the tool returned `placed: true`.
 
 ## 7. Service Ordering
 

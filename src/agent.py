@@ -42,7 +42,7 @@ def build_csr_instructions(
     runtime_rules = """[Current MTS agent runtime]
 Be proactive and helpful. When the customer describes a need, choose the appropriate function tool and execute it rather than only explaining how to do it manually. Read-only lookups (account, tickets, orders, services, shop, billing, notices, organization) can run immediately when relevant. State-changing actions (create ticket, update profile, order service, verify email, file complaint, accept quote) require clear customer confirmation before you call them.
 
-Only the function tools actually registered in this session can execute actions. Names such as show_page, list_tickets, find_equipment, and checkout are not callable unless registered. This agent has no shopping cart, checkout, or payment processing tool, and cannot open a browser or click links on the caller's behalf. Never claim to have completed an action that a tool did not perform. open_mts_website only prepares an approved link in the caller's browser panel; call it before saying a link is ready, and if no support browser is connected, explain the limitation and offer https://mts.192-888-702-801.site/ as a manual destination.
+Only the function tools actually registered in this session can execute actions. search_mts_equipment and place_mts_equipment_order are registered. Use them for catalog lookup and equipment orders. Do not say you cannot place an equipment order, do not send the customer away to check out themselves, and do not invent a cart limitation. Search the live catalog first. Order only a SKU that search returned, and only after the customer confirms that exact product and quantity. If the name they used is not in the catalog, say so and offer the closest listed match. Do not collect or repeat a card number. A pay-now order returns a payment link. Use pay_later only when the account is allowed to be invoiced. Never claim an order was placed unless place_mts_equipment_order returned placed true and an order number.
 
 No separate KNOWLEDGE.md is loaded in this deployment. Use the CSR brief as business reference, and use authorized live tool results for customer facts, current prices, stock, status, and action outcomes. Never claim to have read a file or page that was not provided by a tool. The current UI is a guest support call unless trusted dispatch metadata binds a verified customer or allowlisted operator; a spoken or typed name or email never authenticates an account. Use getMe to verify a bound customer before account-dependent actions. Do not retry an uncertain state-changing call without first checking whether it already succeeded — avoid duplicate submissions.
 
@@ -53,7 +53,7 @@ Always verify the result of every action before claiming it succeeded. End compl
 This session was explicitly dispatched as an allowlisted MTS operator. You may use find_mts_customers to locate a customer and select_mts_customer to bind one exact result before reading or editing that customer's data. Confirm the intended person and consequential changes. create_mts_customer emails a verification code. delete_mts_customer is permanent and requires explicit confirmation naming the selected customer. Do not select a customer from a guessed ID or a spoken email alone."""
     elif customer_id is not None and email:
         scope = """[Verified customer dispatch]
-Trusted dispatch supplied a customer ID and email. The customer's profile is already bound to this session — call getMe at session start to load it, then use the customer's name and account data proactively. Never ask the customer for their email, name, or account ID; that information is already available from the dispatch. Call getMe to confirm that the API record matches before accessing account data. Scope every account tool to that verified customer. Do not offer unsupported checkout or payment actions."""
+Trusted dispatch supplied a customer ID and email. The customer's profile is already bound to this session — call getMe at session start to load it, then use the customer's name and account data proactively. Never ask the customer for their email, name, or account ID; that information is already available from the dispatch. Call getMe to confirm that the API record matches before accessing account data. Scope every account tool to that verified customer. You can search the catalog and place equipment orders for this customer."""
     else:
         scope = """[Guest session]
 This session has no verified customer account. Offer general support and help the caller navigate to the MTS portal. Do not offer to check tickets, orders, billing, or account details in this session. If asked, explain that the caller needs to sign in through the MTS portal first. Do not suggest that a spoken email can unlock access."""
@@ -136,6 +136,74 @@ class DefaultAgent(Agent):
         """Read a page for the verified MTS customer; account is the profile."""
         suffix = "" if page == "account" else f"/{page}"
         return await self.api.request("GET", await self._path(suffix))
+
+    @function_tool()
+    async def search_mts_equipment(self, query: str) -> Any:
+        """Search the live equipment catalog by name, SKU, or description. Call this before offering or ordering a product."""
+        if not query.strip():
+            raise MTSAPIError("Say what equipment to look for")
+        result = await self.api.request(
+            "GET", await self._path("/shop"), params={"q": query.strip()}
+        )
+        equipment = result.get("equipment") if isinstance(result, dict) else None
+        if not isinstance(equipment, list):
+            return result
+        words = [word for word in query.lower().split() if len(word) > 2]
+        ranked = []
+        for item in equipment:
+            if not isinstance(item, dict):
+                continue
+            haystack = " ".join(
+                str(item.get(key, ""))
+                for key in ("sku", "name", "category", "description")
+            ).lower()
+            score = sum(1 for word in words if word in haystack)
+            if score:
+                ranked.append((score, item))
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        matches = [item for _, item in ranked[:5]]
+        return {
+            "query": query.strip(),
+            "matches": matches,
+            "canPurchase": result.get("canPurchase") if isinstance(result, dict) else None,
+            "payLater": result.get("payLater") if isinstance(result, dict) else None,
+        }
+
+    @function_tool()
+    async def place_mts_equipment_order(
+        self,
+        sku: str,
+        quantity: int = 1,
+        pay_later: bool = False,
+        shipping: Literal["standard", "express"] = "standard",
+        address: str | None = None,
+        city: str | None = None,
+        region: str | None = None,
+        postal: str | None = None,
+        notes: str | None = None,
+    ) -> Any:
+        """Place a confirmed catalog item for this customer. Never call this for a SKU that search did not return."""
+        if not sku.strip():
+            raise MTSAPIError("A catalog SKU is required")
+        if quantity < 1 or quantity > 99:
+            raise MTSAPIError("Quantity must be from 1 to 99")
+        payload: dict[str, Any] = {
+            "items": [{"sku": sku.strip(), "quantity": quantity}],
+            "shippingMethod": shipping,
+            "payLater": pay_later,
+        }
+        for key, value in {
+            "address": address,
+            "city": city,
+            "region": region,
+            "postal": postal,
+            "notes": notes,
+        }.items():
+            if value:
+                payload[key] = value
+        return await self.api.request(
+            "POST", await self._path("/orders"), body=payload
+        )
 
     @function_tool()
     async def update_mts_profile(

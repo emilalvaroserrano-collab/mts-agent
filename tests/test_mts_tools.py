@@ -71,6 +71,19 @@ async def test_scoped_ticket_and_monthly_service_calls() -> None:
 
 
 @pytest.mark.asyncio
+async def test_equipment_order_uses_the_confirmed_sku() -> None:
+    agent = DefaultAgent(42, "alex@example.com")
+    api = FakeAPI()
+    agent.api = api
+    agent._verified_customer = {"id": 42, "email": "alex@example.com"}
+    await agent.place_mts_equipment_order._func(agent, "MT-M27", 1)
+    assert api.calls[-1][0] == "POST"
+    assert api.calls[-1][1] == "/api/agent/customers/42/orders"
+    assert api.calls[-1][2]["body"]["items"] == [{"sku": "MT-M27", "quantity": 1}]
+
+
+
+@pytest.mark.asyncio
 async def test_operator_must_search_before_selecting_customer() -> None:
     agent = OperatorAgent(email="ops@example.com", operator=True)
     api = FakeAPI()
