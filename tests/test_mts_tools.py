@@ -65,6 +65,7 @@ async def test_scoped_ticket_and_monthly_service_calls() -> None:
     )
     assert api.calls[2][2]["body"] == {
         "offering": "voip-ext",
+        "quantity": 1,
         "recipientEmail": "alex@example.com",
         "confirmMonthly": True,
     }
@@ -80,7 +81,6 @@ async def test_equipment_order_uses_the_confirmed_sku() -> None:
     assert api.calls[-1][0] == "POST"
     assert api.calls[-1][1] == "/api/agent/customers/42/orders"
     assert api.calls[-1][2]["body"]["items"] == [{"sku": "MT-M27", "quantity": 1}]
-
 
 
 @pytest.mark.asyncio

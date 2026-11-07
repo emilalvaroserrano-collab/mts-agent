@@ -1,24 +1,33 @@
-# MTS Support Call
+# MTS Support Call — Sarah CSR
 
-A phone-style support screen with voice and typed chat. The `web/` Next.js app runs on Vercel; the persistent Python agent in `src/agent.py` runs on LiveKit Cloud or a separate worker host. Guest sessions can answer general questions and offer approved MTS page links. Account records and operator tools require a separate trusted authentication flow.
+Sarah provides voice and chat support inside the signed-in MTS portal. The Next.js app runs on Vercel; the Python LiveKit worker runs separately. This release adds durable conversation history, server-confirmed account actions, receipts, customer context, billing-source lookup, approved knowledge search, and human escalation on the existing ticket.
 
-## Run locally
+Deploy the matching `mts-admin` branch first. Its additive migration and scoped support API are required. See the [portal release and integration guide](https://github.com/emilalvaroserrano-collab/mts-admin/blob/feat/csr-account-workflows/docs/csr-workspace.md).
 
-The root `.env` supplies LiveKit credentials. The ignored `.env.local` supplies the MTS API key and guest access setting. For local development, link `web/.env` to `../.env` and `web/.env.local` to `../.env.local` so the web app and agent use the same local settings. Those links are already present in this checkout and excluded from deployment. Keep both files private.
+## Configuration
 
-1. In one terminal, run `uv sync` then `uv run python src/agent.py dev`.
-2. In another terminal, run `cd web && npm ci && npm run dev`.
-3. Set `CSR_ENABLE_GUEST_ACCESS=true` in `.env.local`, then open `http://localhost:3000`.
+- Worker: LiveKit credentials and `MTS_API_BASE_URL`. `CSR_REALTIME_MODEL=google/gemini-live` and `CSR_VOICE=Aoede` are defaults; `CSR_AMBIENCE_VOLUME=0.12` controls office ambience.
+- Web: the same LiveKit project, `MTS_API_BASE_URL`, and exact comma-separated `NEXT_PUBLIC_MTS_PORTAL_ORIGINS`. No staff/admin API key belongs in the web app.
+- Optional guest support: `CSR_ENABLE_GUEST_ACCESS=true`. Guests cannot read account records, history, or billing.
+- Optional staff dispatch: set `MTS_OPERATOR_KEY` and `MTS_OPERATOR_EMAIL_ALLOWLIST` only on the worker. The legacy `MTS_SUPER_ADMIN_KEY` name is accepted for staff compatibility. Customer sessions never fall back to a staff credential.
 
-The Message button starts a muted LiveKit room; the green answer button starts the same session with a microphone. Voice needs browser permission. Sarah can offer an approved MTS page link, which opens only when the visitor clicks it. Guest sessions have no account identity, so Sarah cannot read or change customer records from this screen.
+The portal issues a one-time authenticated handoff. The web token route redeems it server-side, receives a short-lived credential bound to that customer and portal session, restores the conversation, and dispatches the worker. Portal logout or session rotation revokes that support credential.
 
-## Deploy
+Every account mutation opens a server-generated review sheet. After the customer presses Confirm, the backend claims and executes that exact action once. Catalog price changes invalidate the confirmation. A timeout carries an action ID for reconciliation; do not resubmit an uncertain request.
 
-Create a Vercel project with **Root Directory `web`** and Framework Preset **Next.js**. Configure `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` as server environment variables. Set `CSR_ENABLE_GUEST_ACCESS=true` only when you intend to accept anonymous support calls. The token route ignores client-supplied identity, room, and metadata; it creates a short lived guest token with no customer or operator privileges. Do not set `MTS_SUPER_ADMIN_KEY` on Vercel. Protect or rate limit the public token endpoint before enabling it on an unrestricted public domain, since each call consumes LiveKit resources.
+## Local verification
 
-Deploy the Python worker separately with the existing [Dockerfile](Dockerfile) to LiveKit Cloud. Configure `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `MTS_API_BASE_URL`, and `MTS_SUPER_ADMIN_KEY` for that worker. Set `MTS_OPERATOR_EMAIL_ALLOWLIST` only if a trusted backend will issue authenticated operator dispatches. The worker needs persistent connections and cannot run as a Vercel function. Both deployments must use the same LiveKit project.
+```sh
+uv sync
+uv run pytest
+uv run ruff check src tests
+npm --prefix web ci
+npm --prefix web run typecheck
+npm --prefix web run lint:web
+npm --prefix web run build
+```
 
-For account support, add a portal-authenticated token route that binds the verified customer ID and email to the dispatch. For staff tools, use individual staff authentication and the operator allowlist. The public guest route must never accept either scope from the browser.
+Use a non-production LiveKit project for voice simulations and real call tests. No live credentials are needed for the HTTP-transport unit tests. Browser/OS suspension may pause audio; durable history, in-app updates, and server-side push provide continuity after resume.
 
 ## Next steps
 
@@ -79,14 +88,13 @@ For account support, add a portal-authenticated token route that binds the verif
 Sarah's main CSR system prompt is [src/csr_system_prompt.md](src/csr_system_prompt.md), copied from the supplied brief. `src/agent.py` appends the current deployment's tool and account scope for guest, verified customer, or allowlisted operator sessions. The prompt describes some workflows that this agent cannot execute; only registered tools and verified API results establish current capabilities. There is no separate `KNOWLEDGE.md` loaded in this deployment.
 
 The agent uses the MTS portal API at `MTS_API_BASE_URL` (default:
-`https://mts.192-888-702-801.site`). Set `MTS_SUPER_ADMIN_KEY` in the local
+`https://mts.192-888-702-801.site`). Set `MTS_OPERATOR_KEY` in the local
 ignored `.env.local` file and in your LiveKit Cloud deployment secrets. The
-key is sent as a Bearer token on each API call. Never put it in source code,
+staff key is used only for authenticated operator calls. Customer calls use the portal-issued customer-scoped credential as the Bearer token. Never put it in source code,
 LiveKit job metadata, browser code, or a participant token.
 
 Customer tools are available only when your trusted backend explicitly
-dispatches `mts-agent` with JSON job metadata containing both
-`mts_customer_id` (a positive integer) and `email`. The agent checks that the
+dispatches `mts-agent` with JSON job metadata containing `mts_customer_id` (a positive integer), `email`, `mts_session_token`, and `conversation_id`. The web token route supplies these from a redeemed portal handoff; do not construct them from customer-provided values. The agent checks that the
 API record for that ID has the same email before accessing portal data. A
 spoken or typed email does not establish access. Example metadata produced
 by your backend after authenticating the portal session:
@@ -96,15 +104,14 @@ by your backend after authenticating the portal session:
 ```
 
 Customer actions cover the portal account, menu, home, shop, billing,
-organization, tickets, orders, services, complaints, and notices. The API
-does not provide order creation or payment. Creating a service, ticket, or
+organization, tickets, orders, services, complaints, and notices. The API provides order creation and hosted payment links, subject to customer permissions and a server-generated confirmation. Creating a service, ticket, or
 complaint sends a live request. The agent confirms consequential changes
 before calling a write tool.
 
 For authorized staff only, set `MTS_OPERATOR_EMAIL_ALLOWLIST` to a
 comma-separated list of operator emails and have your trusted backend add
 `"mts_operator": true` to that operator's dispatch metadata. The extra tools
-search, create, select, and delete customers. The backend must authenticate
+search, create, and select customers. Permanent customer/order deletion is disabled in the CSR API. The backend must authenticate
 the operator and control the dispatch metadata; clients must not be allowed
 to supply or change it. Operator search and selection bind one customer for
 the same portal tools. Keep the allowlist empty for customer-only mode.

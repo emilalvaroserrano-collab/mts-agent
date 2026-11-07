@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from livekit.agents import (
     function_tool,
     get_job_context,
     inference,
+    llm,
     room_io,
 )
 from livekit.plugins import (
@@ -40,7 +42,7 @@ def build_csr_instructions(
 ) -> str:
     """Combine the supplied CSR brief with this deployment's trusted scope."""
     runtime_rules = """[Current MTS agent runtime]
-Be proactive and helpful. When the customer describes a need, choose the appropriate function tool and execute it rather than only explaining how to do it manually. Read-only lookups (account, tickets, orders, services, shop, billing, notices, organization) can run immediately when relevant. State-changing actions (create ticket, update profile, order service, place or cancel an order, verify email, file complaint, accept quote, close a ticket) require clear customer confirmation before you call them. You are the highest actor on this account, above a portal Super Admin. Customer grants do not stop you. Do not say a tool is missing. Do not send the customer to do the checkout, ticket, or service request themselves.
+Be proactive and helpful. When the customer describes a need, choose the appropriate function tool and execute it rather than only explaining how to do it manually. Read-only lookups (account, tickets, orders, services, shop, billing, notices, organization) can run immediately when relevant. State-changing actions (create ticket, update profile, order service, place or cancel an order, verify email, file complaint, accept quote, close a ticket) require clear customer confirmation before you call them. Enforce the customer permissions returned by getMe. The customer, staff, and agent use the same purchasing and service policy. Explain denied actions briefly. Every account mutation opens a server-generated review sheet; wait for the customer to press Confirm. Never treat your own tool call as customer consent.
 
 Registered actions include search_mts_equipment, place_mts_equipment_order, pay_mts_order, cancel_mts_order, delete_mts_order, order_mts_service, request_mts_quote, create_mts_ticket, reply_mts_ticket, refresh_mts_ticket, close_mts_ticket, file_mts_complaint, decide_mts_quote, and the account tools. Search the live catalog before ordering equipment. Order only a SKU search returned, after they confirm the product and quantity. If the name is not listed, say so and offer the closest match. Never collect a card number. pay_mts_order returns the payment link. delete_mts_order is permanent and needs confirm=true. Never claim an order, ticket, or request exists unless the tool returned its id or number.
 
@@ -53,7 +55,7 @@ Always verify the result of every action before claiming it succeeded. End compl
 This session was explicitly dispatched as an allowlisted MTS operator. You may use find_mts_customers to locate a customer and select_mts_customer to bind one exact result before reading or editing that customer's data. Confirm the intended person and consequential changes. create_mts_customer emails a verification code. delete_mts_customer is permanent and requires explicit confirmation naming the selected customer. Do not select a customer from a guessed ID or a spoken email alone."""
     elif customer_id is not None and email:
         scope = """[Verified customer dispatch]
-Trusted dispatch supplied a customer ID and email. The customer's profile is already bound to this session — call getMe at session start to load it, then use the customer's name and account data proactively. Never ask the customer for their email, name, or account ID; that information is already available from the dispatch. Call getMe to confirm that the API record matches before accessing account data. Scope every account tool to that verified customer. You can shop, order services, open and close tickets, pay or cancel orders, and request quotes for this customer. A portal Super Admin is not a higher authority than you."""
+Trusted dispatch supplied a customer ID and email. The customer's profile is already bound to this session — call getMe at session start to load it, then use the customer's name and account data proactively. Never ask the customer for their email, name, or account ID; that information is already available from the dispatch. Call getMe to confirm that the API record matches before accessing account data. Scope every account tool to that verified customer. You can shop, order services, open and close tickets, pay or cancel orders, and request quotes for this customer. Customer grants and organization policy remain authoritative."""
     else:
         scope = """[Guest session]
 This session has no verified customer account. Offer general support and help the caller navigate to the MTS portal. Do not offer to check tickets, orders, billing, or account details in this session. If asked, explain that the caller needs to sign in through the MTS portal first. Do not suggest that a spoken email can unlock access."""
@@ -67,8 +69,13 @@ class DefaultAgent(Agent):
         customer_id: int | None = None,
         email: str | None = None,
         operator: bool = False,
+        session_token: str | None = None,
+        conversation_id: str | None = None,
     ) -> None:
-        self.api = MTSAPI()
+        self.api = MTSAPI(session_token, operator=operator)
+        self.api.confirm = self._confirm_action
+        self.api.receipt = self._publish_receipt
+        self.conversation_id = conversation_id
         self.customer_id = customer_id
         self.email = email
         self.operator = operator
@@ -165,7 +172,9 @@ class DefaultAgent(Agent):
         return {
             "query": query.strip(),
             "matches": matches,
-            "canPurchase": result.get("canPurchase") if isinstance(result, dict) else None,
+            "canPurchase": result.get("canPurchase")
+            if isinstance(result, dict)
+            else None,
             "payLater": result.get("payLater") if isinstance(result, dict) else None,
         }
 
@@ -212,33 +221,39 @@ class DefaultAgent(Agent):
         }.items():
             if value:
                 payload[key] = value
-        return await self.api.request(
-            "POST", await self._path("/orders"), body=payload
-        )
+        return await self.api.request("POST", await self._path("/orders"), body=payload)
 
     @function_tool()
     async def pay_mts_order(self, order_id: int) -> Any:
         """Return the payment link for one of this customer's orders. Never ask for a card number."""
         if order_id <= 0:
             raise MTSAPIError("Order ID must be positive")
-        return await self.api.request("POST", await self._path(f"/orders/{order_id}/pay"))
+        return await self.api.request(
+            "POST", await self._path(f"/orders/{order_id}/pay")
+        )
 
     @function_tool()
     async def cancel_mts_order(self, order_id: int) -> Any:
         """Cancel one of this customer's orders after they confirm. Refuses an order that already shipped."""
         if order_id <= 0:
             raise MTSAPIError("Order ID must be positive")
-        return await self.api.request("POST", await self._path(f"/orders/{order_id}/cancel"))
+        return await self.api.request(
+            "POST", await self._path(f"/orders/{order_id}/cancel")
+        )
 
     @function_tool()
     async def delete_mts_order(self, order_id: int, confirm: bool = False) -> Any:
-        """Permanently delete one of this customer's orders. Requires confirm true. This outranks a Super Admin delete."""
+        """Permanently delete one of this customer's orders. Requires confirm true. This operation is unavailable in customer support."""
         if order_id <= 0:
             raise MTSAPIError("Order ID must be positive")
         if not confirm:
-            raise MTSAPIError("Ask the customer to confirm the delete before calling this")
+            raise MTSAPIError(
+                "Ask the customer to confirm the delete before calling this"
+            )
         return await self.api.request(
-            "POST", await self._path(f"/orders/{order_id}/delete"), body={"confirm": True}
+            "POST",
+            await self._path(f"/orders/{order_id}/delete"),
+            body={"confirm": True},
         )
 
     @function_tool()
@@ -246,14 +261,18 @@ class DefaultAgent(Agent):
         """Pull the latest Zendesk status and public comments for one of this customer's tickets."""
         if ticket_id <= 0:
             raise MTSAPIError("Ticket ID must be positive")
-        return await self.api.request("POST", await self._path(f"/tickets/{ticket_id}/refresh"))
+        return await self.api.request(
+            "POST", await self._path(f"/tickets/{ticket_id}/refresh")
+        )
 
     @function_tool()
     async def close_mts_ticket(self, ticket_id: int) -> Any:
         """Close one of this customer's tickets after they confirm."""
         if ticket_id <= 0:
             raise MTSAPIError("Ticket ID must be positive")
-        return await self.api.request("POST", await self._path(f"/tickets/{ticket_id}/close"))
+        return await self.api.request(
+            "POST", await self._path(f"/tickets/{ticket_id}/close")
+        )
 
     @function_tool()
     async def request_mts_quote(self, service_name: str, details: str) -> Any:
@@ -383,18 +402,27 @@ class DefaultAgent(Agent):
         recipient_email: str | None = None,
         drops: int | None = None,
         ship_phone: bool | None = None,
+        quantity: int = 1,
+        site_id: str | None = None,
+        assigned_users: str | None = None,
+        handset_sku: str | None = None,
         confirm_monthly: bool = False,
     ) -> Any:
         """Order a service after confirming terms; voip-ext needs monthly consent."""
         if offering == "voip-ext" and not confirm_monthly:
             raise MTSAPIError("Monthly charge confirmation is required for voip-ext")
-        payload: dict[str, Any] = {"offering": offering}
+        if not 1 <= quantity <= 99:
+            raise MTSAPIError("Quantity must be from 1 to 99")
+        payload: dict[str, Any] = {"offering": offering, "quantity": quantity}
         for key, value in {
             "site": site,
             "notes": notes,
             "recipientEmail": recipient_email,
             "drops": drops,
             "shipPhone": ship_phone,
+            "siteId": site_id,
+            "assignedUsers": assigned_users,
+            "handsetSku": handset_sku,
         }.items():
             if value is not None:
                 payload[key] = value
@@ -441,7 +469,18 @@ class DefaultAgent(Agent):
     @function_tool()
     async def open_mts_website(
         self,
-        page: Literal["home", "shop", "portal", "tickets", "orders", "billing"],
+        page: Literal[
+            "home",
+            "shop",
+            "portal",
+            "tickets",
+            "orders",
+            "billing",
+            "account",
+            "organization",
+            "notifications",
+            "my-services",
+        ],
     ) -> Any:
         """Prepare an MTS website link in the caller's browser panel."""
         paths = {
@@ -451,6 +490,10 @@ class DefaultAgent(Agent):
             "tickets": "/portal/tickets",
             "orders": "/portal/orders",
             "billing": "/portal/billing",
+            "account": "/portal/account",
+            "organization": "/portal/organization",
+            "notifications": "/portal/notifications",
+            "my-services": "/portal/my-services",
         }
         room = get_job_context().room
         frontend = next(
@@ -472,32 +515,136 @@ class DefaultAgent(Agent):
             )
         except Exception as exc:
             raise MTSAPIError("The support browser did not accept the link") from exc
-        return {"browser": response, "note": "A link is ready for the visitor to open"}
+        return {
+            "browser": json.loads(response),
+            "note": "Report navigated only when the browser confirms it. Otherwise a link is prepared.",
+        }
+
+    async def _confirm_action(self, action: dict[str, Any]) -> bool:
+        room = get_job_context().room
+        frontend = next(
+            (
+                identity
+                for identity in room.remote_participants
+                if identity.startswith(("csr-", "visitor-"))
+            ),
+            None,
+        )
+        if frontend is None:
+            raise MTSAPIError(
+                "A connected support screen is required to review this action"
+            )
+        try:
+            result = await room.local_participant.perform_rpc(
+                destination_identity=frontend,
+                method="mts.confirmAction",
+                payload=json.dumps(action),
+                response_timeout=120.0,
+            )
+            return json.loads(result).get("confirmed") is True
+        except Exception as exc:
+            raise MTSAPIError(
+                "This action was not confirmed. Nothing was submitted."
+            ) from exc
+
+    async def _publish_receipt(self, receipt: dict[str, Any]) -> None:
+        room = get_job_context().room
+        frontend = next(
+            (
+                identity
+                for identity in room.remote_participants
+                if identity.startswith("csr-")
+            ),
+            None,
+        )
+        if frontend:
+            await room.local_participant.perform_rpc(
+                destination_identity=frontend,
+                method="mts.actionReceipt",
+                payload=json.dumps(receipt),
+                response_timeout=5.0,
+            )
+
+    @function_tool()
+    async def search_mts_knowledge(self, query: str) -> Any:
+        """Search approved support guides and policy for this customer's organization."""
+        return await self.api.request(
+            "GET", await self._path("/knowledge"), params={"q": query}
+        )
+
+    @function_tool()
+    async def read_mts_context(self) -> Any:
+        """Read the customer's sites, contacts, support agreement, policy, and service activation state."""
+        result = await self.api.request("GET", await self._path("/context"))
+        room = get_job_context().room
+        participant = next(
+            (
+                p
+                for identity, p in room.remote_participants.items()
+                if identity.startswith("csr-")
+            ),
+            None,
+        )
+        if isinstance(result, dict):
+            result["currentPage"] = (
+                participant.attributes.get("mts.page", "/portal")
+                if participant
+                else "/portal"
+            )
+        return result
+
+    @function_tool()
+    async def read_mts_ledger(self) -> Any:
+        """Read synchronized invoices, due dates, balances, and quoted or active recurring service charges. A missing billing feed means balances are unknown."""
+        return await self.api.request("GET", await self._path("/ledger"))
+
+    @function_tool()
+    async def read_mts_action_status(self, action_id: str) -> Any:
+        """Reconcile a confirmed request after an uncertain response. Never repeat a manual-review or executing action."""
+        return await self.api.request(
+            "GET", await self._path(f"/confirmations/{action_id}")
+        )
+
+    @function_tool()
+    async def escalate_mts_ticket(self, ticket_id: int, reason: str) -> Any:
+        """Hand the existing ticket to the human support desk with the issue and steps already tried."""
+        if ticket_id <= 0 or not reason.strip():
+            raise MTSAPIError("A ticket and escalation summary are required")
+        return await self.api.request(
+            "POST",
+            await self._path(f"/tickets/{ticket_id}/escalate"),
+            body={"reason": reason[:2000]},
+        )
 
     async def on_enter(self):
-        # Proactively load the bound customer profile so Sarah never asks
-        # for information already available from trusted dispatch.
-        profile = None
-        if self.customer_id is not None and self.email:
-            profile = await self.get_me()
-
+        profile = (
+            await self.get_me() if self.customer_id is not None and self.email else None
+        )
+        if self.conversation_id and profile and not profile.get("error"):
+            try:
+                messages = await self.api.request(
+                    "GET",
+                    await self._path(f"/conversations/{self.conversation_id}/messages"),
+                )
+                context = llm.ChatContext()
+                for message in messages[-20:] if isinstance(messages, list) else []:
+                    if message.get("role") in {"user", "assistant"}:
+                        context.add_message(
+                            role=message["role"], content=str(message.get("body", ""))
+                        )
+                await self.update_chat_ctx(context)
+            except MTSAPIError:
+                logger.warning("Conversation history could not be loaded")
         if self.operator:
-            greeting = "Welcome to Manage Tech Services. I'm Sarah, your support agent. I can look up customers, create accounts, manage tickets, orders, services, and billing. What would you like to do first?"
-        elif (
-            profile
-            and not profile.get("error")
-            and self.customer_id is not None
-            and self.email
-        ):
-            name = profile.get("name") or str(profile.get("email", "")).split("@")[0]
-            greeting = f"Welcome back, {name}. I'm Sarah, your support agent. Your account is linked to this session. I can check your tickets and orders, update your profile, order services, file complaints, read notices, and more. What can I help you with today?"
-        elif self.customer_id is not None and self.email:
-            greeting = "Welcome to Manage Tech Services. I'm Sarah, your support agent. Your account is linked to this session. I can check your tickets and orders, update your profile, order services, file complaints, read notices, and more. What can I help you with today?"
+            greeting = "Say: Hi, this is Sarah. What can I help you with?"
+        elif profile and not profile.get("error"):
+            name = (profile.get("context") or {}).get("profile") or {}
+            name = name.get("preferred_name") or profile.get("name") or ""
+            greeting = f"Greet {name} naturally in one short sentence and ask what they need. If earlier messages show an unresolved issue, refer to it briefly. Do not list capabilities or repeat an introduction."
         else:
-            greeting = "Welcome to Manage Tech Services. I'm Sarah, your support agent. This is a guest session. I can answer general questions and point you to the right MTS pages. If you need to check tickets, orders, billing, or your account, please sign in through the MTS portal first. What would you like help with?"
+            greeting = "Say: Hi, this is Sarah at Manage Tech Services. How can I help? Account work requires a linked portal session; mention that only when relevant."
         await self.session.generate_reply(
-            instructions=greeting,
-            allow_interruptions=True,
+            instructions=greeting, allow_interruptions=True
         )
 
 
@@ -624,17 +771,55 @@ async def entrypoint(ctx: JobContext):
     operator = bool(
         metadata.get("mts_operator") is True and email and email.casefold() in allowlist
     )
+    agent = (OperatorAgent if operator else DefaultAgent)(
+        customer_id,
+        email,
+        operator,
+        metadata.get("mts_session_token"),
+        metadata.get("conversation_id"),
+    )
     session = AgentSession(
         llm=inference.RealtimeModel(
-            model="xai/grok-voice-3.0",
-            voice="carina",
+            model=os.getenv("CSR_REALTIME_MODEL", "google/gemini-live"),
+            voice=os.getenv("CSR_VOICE", "Aoede"),
         ),
     )
 
+    pending: set[asyncio.Task[Any]] = set()
+
+    async def persist(item: Any) -> None:
+        content = getattr(item, "text_content", None)
+        role = getattr(item, "role", None)
+        if (
+            not agent.conversation_id
+            or role not in {"user", "assistant"}
+            or not content
+            or "[[mts-" in content
+        ):
+            return
+        try:
+            await agent.api.request(
+                "POST",
+                await agent._path(f"/conversations/{agent.conversation_id}/messages"),
+                body={"externalId": item.id, "role": role, "body": content},
+            )
+        except MTSAPIError:
+            logger.exception("Conversation persistence failed")
+
+    @session.on("conversation_item_added")
+    def conversation_item_added(event: Any) -> None:
+        task = asyncio.create_task(persist(event.item))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    async def flush_history() -> None:
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    ctx.add_shutdown_callback(flush_history)
+
     await session.start(
-        agent=(OperatorAgent if operator else DefaultAgent)(
-            customer_id, email, operator
-        ),
+        agent=agent,
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -646,7 +831,10 @@ async def entrypoint(ctx: JobContext):
     )
 
     background_audio = BackgroundAudioPlayer(
-        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=1.0),
+        ambient_sound=AudioConfig(
+            BuiltinAudioClip.OFFICE_AMBIENCE,
+            volume=max(0.0, min(1.0, float(os.getenv("CSR_AMBIENCE_VOLUME", "0.12")))),
+        ),
     )
 
     await background_audio.start(room=ctx.room, agent_session=session)
